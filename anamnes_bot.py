@@ -39,21 +39,22 @@ def get_random_quote():
 
 # --- ОБРАБОТЧИКИ КОМАНД ---
 
+
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     user_id = message.from_user.id
-    # Устанавливаем настройки по умолчанию (каждый день)
     user_settings[user_id] = {'frequency': 'daily', 'last_sent': None}
     await message.answer(
         "Добро пожаловать! 📖\n"
-        'Я присылаю случайные цитаты из книги Якупа Шапиро "Анамнез".\n'
+        "Я присылаю случайные цитаты из книги Якупа Шапиро 'Анамнез'.\n"
         "Используйте /settings, чтобы настроить частоту получения цитат.\n"
         "Или нажмите /quote, чтобы получить цитату прямо сейчас."
     )
 
+
 @dp.message(Command("quote"))
 async def cmd_quote(message: types.Message):
-    await message.answer(f"✨ {get_random_quote()}")
+    await message.answer(get_random_quote())
 
 @dp.message(Command("settings"))
 async def cmd_settings(message: types.Message):
@@ -120,7 +121,7 @@ async def scheduled_quote_sender():
         
         if should_send:
             try:
-                await bot.send_message(user_id, f"📜 {get_random_quote()}")
+                await bot.send_message(user_id, get_random_quote())
                 user_settings[user_id]['last_sent'] = now
                 print(f"Цитата отправлена пользователю {user_id}")
             except Exception as e:
