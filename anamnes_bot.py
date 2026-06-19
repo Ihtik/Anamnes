@@ -1,11 +1,13 @@
-
 import asyncio
 import random
 import os
+import datetime
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.fsm.storage.memory import MemoryStorage
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.interval import IntervalTrigger
 
 # --- КОНФИГУРАЦИЯ (ЗАМЕНИТЕ ТОКЕН!) ---
 BOT_TOKEN = '8549796511:AAF6yKk3dd-gUW7JksFcyxm0xY9tNE69WVU'  # Вставьте ваш токен
@@ -44,20 +46,19 @@ async def cmd_start(message: types.Message):
     user_settings[user_id] = {'frequency': 'daily', 'last_sent': None}
     await message.answer(
         "Добро пожаловать! 📖\n"
-        "Я присылаю случайные цитаты из книги. "
+        "Я присылаю случайные цитаты из книги Якупа Шапиро "Анамнез".\n"
         "Используйте /settings, чтобы настроить частоту получения цитат.\n"
         "Или нажмите /quote, чтобы получить цитату прямо сейчас."
     )
 
 @dp.message(Command("quote"))
 async def cmd_quote(message: types.Message):
-    """Отправляет случайную цитату по запросу."""
     await message.answer(f"✨ {get_random_quote()}")
 
 @dp.message(Command("settings"))
 async def cmd_settings(message: types.Message):
-    """Показывает меню настройки частоты."""
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Каждый час", callback_data="freq_hourly")],
         [InlineKeyboardButton(text="Каждый день", callback_data="freq_daily")],
         [InlineKeyboardButton(text="Раз в 2 дня", callback_data="freq_2days")],
         [InlineKeyboardButton(text="Раз в неделю", callback_data="freq_weekly")],
@@ -67,9 +68,9 @@ async def cmd_settings(message: types.Message):
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("freq_"))
 async def process_frequency_callback(callback_query: CallbackQuery):
-    """Обрабатывает выбор частоты."""
     user_id = callback_query.from_user.id
     freq_map = {
+        'freq_hourly': 'hourly',
         'freq_daily': 'daily',
         'freq_2days': '2days',
         'freq_weekly': 'weekly',
@@ -82,6 +83,7 @@ async def process_frequency_callback(callback_query: CallbackQuery):
     user_settings[user_id]['frequency'] = new_freq
 
     freq_text = {
+        'hourly': 'каждый час',
         'daily': 'каждый день',
         '2days': 'раз в 2 дня',
         'weekly': 'раз в неделю',
@@ -91,23 +93,48 @@ async def process_frequency_callback(callback_query: CallbackQuery):
     await callback_query.answer()
     await callback_query.message.edit_text(f"✅ Настройка сохранена! Цитаты будут приходить: {freq_text}.")
 
-# --- ФУНКЦИЯ ДЛЯ РАССЫЛКИ (ЕЁ ВЫЗЫВАЕТ ПЛАНИРОВЩИК) ---
+# --- ФУНКЦИЯ ДЛЯ РАССЫЛКИ (ВЫЗЫВАЕТСЯ ПЛАНИРОВЩИКОМ) ---
 async def scheduled_quote_sender():
     """Проверяет всех пользователей и отправляет цитаты по расписанию."""
-    # Здесь должна быть логика проверки, кому и когда отправлять.
-    # В этом примере для простоты мы просто отправляем всем, у кого frequency != 'off'.
-    # Для реального проекта нужно добавить проверку даты последней отправки.
+    now = datetime.datetime.now()
     for user_id, settings in user_settings.items():
-        if settings.get('frequency') != 'off':
+        freq = settings.get('frequency')
+        last_sent = settings.get('last_sent')
+        
+        # Проверяем, нужно ли отправить цитату прямо сейчас
+        should_send = False
+        if freq == 'hourly':
+            if last_sent is None or (now - last_sent).total_seconds() >= 3600:
+                should_send = True
+        elif freq == 'daily':
+            if last_sent is None or (now - last_sent).total_seconds() >= 86400:
+                should_send = True
+        elif freq == '2days':
+            if last_sent is None or (now - last_sent).total_seconds() >= 86400 * 2:
+                should_send = True
+        elif freq == 'weekly':
+            if last_sent is None or (now - last_sent).total_seconds() >= 86400 * 7:
+                should_send = True
+        elif freq == 'off':
+            should_send = False
+        
+        if should_send:
             try:
                 await bot.send_message(user_id, f"📜 {get_random_quote()}")
+                user_settings[user_id]['last_sent'] = now
                 print(f"Цитата отправлена пользователю {user_id}")
-                # Здесь нужно обновить user_settings[user_id]['last_sent'] = сегодня
             except Exception as e:
-                print(f"Не удалось отправить сообщение {user_id}: {e}")
+                print(f"Не удалось отправить {user_id}: {e}")
 
-# --- ЗАПУСК БОТА ---
+# --- ЗАПУСК БОТА С ПЛАНИРОВЩИКОМ ---
 async def main():
+    # Настраиваем планировщик
+    scheduler = AsyncIOScheduler()
+    # Запускаем проверку каждую минуту
+    scheduler.add_job(scheduled_quote_sender, IntervalTrigger(minutes=1))
+    scheduler.start()
+    print("Планировщик запущен!")
+    
     # Запускаем бота
     await dp.start_polling(bot)
 
