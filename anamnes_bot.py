@@ -2,6 +2,7 @@ import asyncio
 import random
 import json
 import datetime
+import os  # Добавлен для проверки существования файла
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
@@ -10,10 +11,10 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
 # --- КОНФИГУРАЦИЯ ---
-BOT_TOKEN = '8549796511:AAF6yKk3dd-gUW7JksFcyxm0xY9tNE69WVU'  # Вставьте ваш токен
-QUOTES_FILE = 'quotes_anamnes.txt'     # Имя вашего файла с цитатами
-ADMIN_ID = 6944462724                   # Ваш Chat ID для доступа к /stats
-DATA_FILE = 'users_data.json'           # Файл для хранения статистики
+BOT_TOKEN = '8549796511:AAF6yKk3dd-gUW7JksFcyxm0xY9tNE69WVU'
+QUOTES_FILE = 'quotes_anamnes.txt'
+ADMIN_ID = 6944462724
+DATA_FILE = 'users_data.json'
 # -------------------------------------
 
 # Инициализация бота и диспетчера
@@ -21,20 +22,47 @@ bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
-# --- РАБОТА С ДАННЫМИ (СОХРАНЕНИЕ И ЗАГРУЗКА) ---
+# --- РАБОТА С ДАННЫМИ ---
 
 def load_data():
-    """Загружает данные пользователей из JSON-файла"""
+    """Загружает данные пользователей из JSON-файла. Если файл повреждён или отсутствует — создаёт пустой."""
+    if not os.path.exists(DATA_FILE):
+        # Если файла нет, создаём его с пустым словарём
+        with open(DATA_FILE, 'w', encoding='utf-8') as f:
+            json.dump({}, f, indent=2, ensure_ascii=False)
+        print(f"📄 Создан новый файл {DATA_FILE}")
+        return {}
+    
     try:
         with open(DATA_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+            data = json.load(f)
+            # Проверяем, что данные — это словарь
+            if not isinstance(data, dict):
+                print("⚠️ Данные в файле повреждены (не словарь). Пересоздаём файл.")
+                with open(DATA_FILE, 'w', encoding='utf-8') as fw:
+                    json.dump({}, fw, indent=2, ensure_ascii=False)
+                return {}
+            return data
+    except json.JSONDecodeError:
+        print("⚠️ Ошибка чтения JSON. Пересоздаём файл.")
+        with open(DATA_FILE, 'w', encoding='utf-8') as f:
+            json.dump({}, f, indent=2, ensure_ascii=False)
+        return {}
+    except Exception as e:
+        print(f"❌ Неизвестная ошибка при загрузке данных: {e}")
         return {}
 
 def save_data(data):
-    """Сохраняет данные пользователей в JSON-файл"""
-    with open(DATA_FILE, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    """Сохраняет данные пользователей в JSON-файл с резервным копированием."""
+    try:
+        # Сначала сохраняем в новый файл, потом переименовываем (чтобы не повредить данные при сбое)
+        temp_file = DATA_FILE + '.tmp'
+        with open(temp_file, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        os.replace(temp_file, DATA_FILE)  # Атомарная замена
+        print(f"💾 Данные сохранены. Всего записей: {len(data)}")
+    except Exception as e:
+        print(f"❌ Ошибка сохранения данных: {e}")
 
 # Загружаем данные при старте
 user_settings = load_data()
@@ -68,7 +96,6 @@ def get_user_stats_summary():
     total_quotes_sent = 0
     
     for uid, data in user_settings.items():
-        # Активность за сегодня
         last_act = data.get('last_activity')
         if last_act:
             try:
@@ -80,12 +107,10 @@ def get_user_stats_summary():
             except:
                 pass
         
-        # Частота
         freq = data.get('frequency', 'daily')
         if freq in freq_counts:
             freq_counts[freq] += 1
         
-        # Всего отправленных цитат
         total_quotes_sent += data.get('quotes_sent', 0)
     
     freq_text = {
@@ -109,12 +134,12 @@ def get_user_stats_summary():
 
 # --- ОБРАБОТЧИКИ КОМАНД ---
 
-def log_activity(user_id, action, extra=None):
-    """Записывает действие пользователя в его данные"""
-    if str(user_id) not in user_settings:
-        return
-    user_settings[str(user_id)]['last_activity'] = datetime.datetime.now().isoformat()
-    save_data(user_settings)
+def update_user_activity(user_id):
+    """Обновляет время последней активности и сохраняет данные"""
+    uid = str(user_id)
+    if uid in user_settings:
+        user_settings[uid]['last_activity'] = datetime.datetime.now().isoformat()
+        save_data(user_settings)
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
@@ -140,7 +165,6 @@ async def cmd_start(message: types.Message):
         # Обновляем активность
         user_settings[user_id]['last_activity'] = now
         user_settings[user_id]['username'] = message.from_user.username
-        user_settings[user_id]['first_name'] = message.from_user.first_name
         save_data(user_settings)
     
     await message.answer(
@@ -157,7 +181,6 @@ async def cmd_quote(message: types.Message):
     quote = get_random_quote()
     await message.answer(quote)
     
-    # Логируем получение цитаты
     if user_id in user_settings:
         user_settings[user_id]['last_activity'] = datetime.datetime.now().isoformat()
         user_settings[user_id]['quotes_sent'] = user_settings[user_id].get('quotes_sent', 0) + 1
@@ -181,7 +204,6 @@ async def cmd_settings(message: types.Message):
 
 @dp.message(Command("stats"))
 async def cmd_stats(message: types.Message):
-    """Отправляет статистику только администратору"""
     if message.from_user.id != ADMIN_ID:
         await message.answer("⛔ Эта команда доступна только администратору.")
         return
