@@ -9,6 +9,7 @@ from functools import partial
 from hashlib import sha256
 from pathlib import Path
 from time import monotonic
+from urllib.parse import urlencode, urlsplit
 from aiogram import Bot, Dispatcher, types
 from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError
 from aiogram.filters import Command
@@ -40,6 +41,9 @@ FREQUENCY_LABELS = {
 }
 UTC = datetime.timezone.utc
 DEFAULT_SEND_OFFSET = "+05:00"
+NEW_SUBSCRIPTION_FREQUENCIES = ("daily", "weekly")
+TIME_PICKER_URL = ""
+UNSUBSCRIBE_BUTTON = "Отписаться"
 SEND_TIME_PROMPT = "Ответьте временем в формате ЧЧ:ММ, например 18:00 или 15:34."
 FREQUENCY_TIME_PROMPTS = {
     "hourly": (
@@ -291,19 +295,70 @@ async def process_restart_round(callback: CallbackQuery):
 @dp.message(Command("settings"))
 async def cmd_settings(message: types.Message):
     user_id = str(message.from_user.id)
-    if user_id in user_settings:
-        user_settings[user_id]['last_activity'] = datetime.datetime.now().isoformat()
+    settings = user_settings.get(user_id)
+    if settings is not None:
+        settings["last_activity"] = datetime.datetime.now().isoformat()
         save_data(user_settings)
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Каждый час", callback_data="freq_hourly")],
-        [InlineKeyboardButton(text="Каждый день", callback_data="freq_daily")],
-        [InlineKeyboardButton(text="Раз в 2 дня", callback_data="freq_2days")],
-        [InlineKeyboardButton(text="Раз в неделю", callback_data="freq_weekly")],
-        [InlineKeyboardButton(text="Время рассылки", callback_data="schedule_regular")],
-        [InlineKeyboardButton(text="Отписаться", callback_data="freq_off")]
-    ])
+
+    if TIME_PICKER_URL and message.chat.type == "private":
+        saved_time = (settings or {}).get("send_time", "")
+        keyboard = types.ReplyKeyboardMarkup(
+            keyboard=[
+                [
+                    time_picker_button("Каждый день", "daily", saved_time),
+                    time_picker_button("Раз в неделю", "weekly", saved_time),
+                ],
+                [
+                    time_picker_button("Время рассылки", "current", saved_time),
+                    types.KeyboardButton(text=UNSUBSCRIBE_BUTTON),
+                ],
+            ],
+            resize_keyboard=True,
+            one_time_keyboard=True,
+        )
+    else:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Каждый день", callback_data="freq_daily")],
+            [InlineKeyboardButton(text="Раз в неделю", callback_data="freq_weekly")],
+            [InlineKeyboardButton(text="Время рассылки", callback_data="schedule_regular")],
+            [InlineKeyboardButton(text=UNSUBSCRIBE_BUTTON, callback_data="freq_off")],
+        ])
     await message.answer("Настройте частоту и время рассылки:", reply_markup=keyboard)
+
+
+def time_picker_button(label, frequency, saved_time):
+    query = urlencode({"frequency": frequency, "time": saved_time})
+    return types.KeyboardButton(text=label, web_app=types.WebAppInfo(url=f"{TIME_PICKER_URL}?{query}"))
+
+
+@dp.message(lambda message: message.web_app_data is not None and message.chat.type == "private")
+async def process_time_picker(message: types.Message):
+    try:
+        selected = json.loads(message.web_app_data.data)
+        frequency = selected["frequency"]
+        hour = selected["hour"]
+        minute = selected["minute"]
+        offset = selected["offset"]
+        if frequency not in ("current", *NEW_SUBSCRIPTION_FREQUENCIES):
+            raise ValueError
+        if type(hour) is not int or type(minute) is not int or type(offset) is not int:
+            raise ValueError
+        if not (0 <= hour < 24 and 0 <= minute < 60 and -14 * 60 <= offset <= 14 * 60):
+            raise ValueError
+        clock_time = datetime.time(hour, minute, tzinfo=datetime.timezone(datetime.timedelta(minutes=offset)))
+    except (KeyError, TypeError, ValueError):
+        await message.answer("Не удалось сохранить время. Откройте /settings и попробуйте ещё раз.")
+        return
+    selected_frequency = None if frequency == "current" else frequency
+    response = save_regular_send_time(str(message.from_user.id), clock_time, selected_frequency)
+    await message.answer(response, reply_markup=types.ReplyKeyboardRemove())
+
+
+@dp.message(lambda message: message.chat.type == "private" and message.text == UNSUBSCRIBE_BUTTON)
+async def cmd_unsubscribe(message: types.Message):
+    unsubscribe(str(message.from_user.id))
+    await message.answer("Рассылка отключена.", reply_markup=types.ReplyKeyboardRemove())
+
 
 @dp.message(Command("stats"))
 async def cmd_stats(message: types.Message):
@@ -493,6 +548,9 @@ async def store_regular_send_time(message: types.Message, text: str, frequency=N
     if message.chat.type != "private":
         await ask_send_time(message)
         return
+    if frequency is not None and frequency not in NEW_SUBSCRIPTION_FREQUENCIES:
+        await message.answer("Выберите «Каждый день» или «Раз в неделю» в /settings.")
+        return
     user_id = str(message.from_user.id)
     previous = user_settings.get(user_id, {})
     effective_frequency = frequency or previous.get("frequency")
@@ -511,6 +569,10 @@ async def store_regular_send_time(message: types.Message, text: str, frequency=N
     except ValueError:
         await ask_send_time(message, frequency)
         return
+    await message.answer(save_regular_send_time(user_id, clock_time, frequency))
+
+
+def save_regular_send_time(user_id, clock_time, frequency):
     settings = user_settings.setdefault(user_id, {})
     if frequency:
         settings["frequency"] = frequency
@@ -520,7 +582,8 @@ async def store_regular_send_time(message: types.Message, text: str, frequency=N
     set_next_regular_delivery(settings, datetime.datetime.now(UTC))
     save_data(user_settings)
 
-    if effective_frequency == "hourly":
+    offset = settings["send_time"][5:]
+    if settings.get("frequency") == "hourly":
         response = f"Рассылка каждый час в {clock_time.minute:02d}-ю минуту (UTC{offset})."
     else:
         response = f"Время рассылки сохранено: {clock_time:%H:%M} (UTC{offset})."
@@ -529,7 +592,7 @@ async def store_regular_send_time(message: types.Message, text: str, frequency=N
         response += f"\nБлижайшая отправка по этому расписанию: {next_regular:%d.%m.%Y в %H:%M}."
     else:
         response += "\nЧтобы включить рассылку, выберите частоту в /settings."
-    await message.answer(response)
+    return response
 
 
 def next_quote_instructions():
@@ -610,17 +673,22 @@ async def process_frequency_callback(callback_query: CallbackQuery):
     if not isinstance(message, types.Message):
         return
     frequency = callback_query.data.removeprefix("freq_")
-    if frequency in INTERVALS:
+    if frequency in NEW_SUBSCRIPTION_FREQUENCIES:
         await ask_send_time(message, frequency)
     elif frequency == "off":
-        user_id = str(callback_query.from_user.id)
-        settings = user_settings.setdefault(user_id, {})
-        settings["frequency"] = "off"
-        settings.pop("next_quote_at", None)
-        settings.pop("next_regular_at", None)
-        settings["last_activity"] = datetime.datetime.now().isoformat()
-        save_data(user_settings)
+        unsubscribe(str(callback_query.from_user.id))
         await message.edit_text("Рассылка отключена.")
+    elif frequency in INTERVALS:
+        await message.answer("Выберите «Каждый день» или «Раз в неделю» в /settings.")
+
+
+def unsubscribe(user_id):
+    settings = user_settings.setdefault(user_id, {})
+    settings["frequency"] = "off"
+    settings.pop("next_quote_at", None)
+    settings.pop("next_regular_at", None)
+    settings["last_activity"] = datetime.datetime.now().isoformat()
+    save_data(user_settings)
 
 # --- РАССЫЛКА ПО РАСПИСАНИЮ ---
 
@@ -727,6 +795,40 @@ async def register_bot_commands():
             await bot.set_my_commands(updated_commands, language_code=language_code)
 
 
+async def start_time_picker_server():
+    global TIME_PICKER_URL
+    domain = os.getenv("DOMAIN", "").strip() or urlsplit(os.getenv("WEBHOOK_URL", "")).netloc
+    if not domain:
+        return None
+
+    from aiohttp import web
+
+    async def time_picker(_request):
+        return web.FileResponse(
+            Path(__file__).with_name("time_picker.html"),
+            headers={"Cache-Control": "no-cache"},
+        )
+
+    async def health(_request):
+        return web.Response(text="OK")
+
+    app = web.Application()
+    app.router.add_get("/time-picker", time_picker)
+    app.router.add_get("/health", health)
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    try:
+        await web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", "3000"))).start()
+    except (OSError, ValueError) as error:
+        await runner.cleanup()
+        print(f"Не удалось запустить страницу выбора времени: {error}", flush=True)
+        return None
+
+    TIME_PICKER_URL = f"https://{domain}/time-picker"
+    print(f"🕒 Выбор времени: {TIME_PICKER_URL}", flush=True)
+    return runner
+
+
 async def main():
     try:
         profile_changes = await update_telegram_descriptions()
@@ -738,6 +840,7 @@ async def main():
         print("📋 Меню команд Telegram: /stats — Число подписчиков, /feedback — Написать автору", flush=True)
     except TelegramAPIError as error:
         print(f"❌ Не удалось обновить меню команд Telegram: {error}", flush=True)
+    time_picker_runner = await start_time_picker_server()
     scheduler = AsyncIOScheduler()
     first_tick = datetime.datetime.now(UTC).replace(second=0, microsecond=0) + datetime.timedelta(minutes=1)
     scheduler.add_job(scheduled_quote_sender, IntervalTrigger(minutes=1, start_date=first_tick, timezone=UTC))
@@ -752,7 +855,11 @@ async def main():
         flush=True,
     )
     
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        if time_picker_runner is not None:
+            await time_picker_runner.cleanup()
 
 if __name__ == "__main__":
     asyncio.run(main())
