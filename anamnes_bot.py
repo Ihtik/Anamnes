@@ -282,7 +282,6 @@ async def cmd_settings(message: types.Message):
         [InlineKeyboardButton(text="Раз в 2 дня", callback_data="freq_2days")],
         [InlineKeyboardButton(text="Раз в неделю", callback_data="freq_weekly")],
         [InlineKeyboardButton(text="Время рассылки", callback_data="schedule_regular")],
-        [InlineKeyboardButton(text="Время следующего отрывка", callback_data="schedule_next")],
         [InlineKeyboardButton(text="Отписаться", callback_data="freq_off")]
     ])
     await message.answer("Настройте частоту и время рассылки:", reply_markup=keyboard)
