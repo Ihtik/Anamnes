@@ -3,12 +3,13 @@ import random
 import json
 import datetime
 import os
+import re
 from collections import defaultdict
 from functools import partial
 from hashlib import sha256
 from pathlib import Path
 from aiogram import Bot, Dispatcher, types
-from aiogram.exceptions import TelegramForbiddenError
+from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -37,6 +38,12 @@ FREQUENCY_LABELS = {
     'off': 'отключена',
 }
 UTC = datetime.timezone.utc
+DEFAULT_SEND_OFFSET = "+05:00"
+SEND_TIME_PROMPT = (
+    "Ответьте временем в формате ЧЧ:ММ, например 18:00 или 15:34.\n"
+    "При первой настройке используется UTC+05:00. Для другого часового пояса "
+    "укажите его после времени, например 18:00 +03:00."
+)
 # -------------------------------------
 
 # Инициализация бота и диспетчера
@@ -123,6 +130,19 @@ def get_user_stats_summary():
 
 # --- ОБРАБОТЧИКИ КОМАНД ---
 
+def set_next_regular_delivery(settings, now):
+    send_time = settings.get("send_time")
+    if send_time and settings.get("frequency") in INTERVALS:
+        clock_time = datetime.time.fromisoformat(send_time)
+        local_now = now.astimezone(clock_time.tzinfo)
+        due_at = datetime.datetime.combine(local_now.date(), clock_time)
+        if due_at <= local_now:
+            due_at += datetime.timedelta(days=1)
+        settings["next_regular_at"] = due_at.astimezone(UTC).isoformat()
+    else:
+        settings.pop("next_regular_at", None)
+
+
 async def send_round_complete(send, settings):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Начать новый круг", callback_data="restart_round")]
@@ -144,6 +164,8 @@ async def deliver_quote(send, settings, remaining, *, scheduled=False, private=T
             [InlineKeyboardButton(text="Следующий отрывок", callback_data="next_quote")]
         ])
     scheduled_override = settings.get("next_quote_at")
+    scheduled_regular = settings.get("next_regular_at")
+    interval = INTERVALS.get(settings.get("frequency"))
     await send(QUOTES_BY_ID[quote_id], reply_markup=keyboard)
     settings.setdefault("seen_quote_ids", []).append(quote_id)
     settings["quotes_sent"] = settings.get("quotes_sent", 0) + 1
@@ -152,6 +174,13 @@ async def deliver_quote(send, settings, remaining, *, scheduled=False, private=T
         settings["last_sent"] = now
         if scheduled_override == settings.get("next_quote_at"):
             settings.pop("next_quote_at", None)
+        if scheduled_regular and interval and scheduled_regular == settings.get("next_regular_at"):
+            due_at = datetime.datetime.fromisoformat(scheduled_regular)
+            utc_now = datetime.datetime.now(UTC)
+            if due_at <= utc_now:
+                step = datetime.timedelta(seconds=interval)
+                missed_steps = (utc_now - due_at) // step
+                settings["next_regular_at"] = (due_at + (missed_steps + 1) * step).isoformat()
     else:
         settings["last_activity"] = now
         if private:
@@ -232,6 +261,7 @@ async def process_restart_round(callback: CallbackQuery):
         settings["seen_quote_ids"] = []
         settings.pop("round_notice_sent", None)
         settings["last_sent"] = datetime.datetime.now().isoformat()
+        set_next_regular_delivery(settings, datetime.datetime.now(UTC))
         save_data(user_settings)
         await deliver_quote(
             callback.message.answer, settings, list(QUOTES_BY_ID),
@@ -251,10 +281,11 @@ async def cmd_settings(message: types.Message):
         [InlineKeyboardButton(text="Каждый день", callback_data="freq_daily")],
         [InlineKeyboardButton(text="Раз в 2 дня", callback_data="freq_2days")],
         [InlineKeyboardButton(text="Раз в неделю", callback_data="freq_weekly")],
+        [InlineKeyboardButton(text="Время рассылки", callback_data="schedule_regular")],
         [InlineKeyboardButton(text="Время следующего отрывка", callback_data="schedule_next")],
         [InlineKeyboardButton(text="Отписаться", callback_data="freq_off")]
     ])
-    await message.answer("Выберите, как часто вы хотите получать цитаты:", reply_markup=keyboard)
+    await message.answer("Настройте частоту и время рассылки:", reply_markup=keyboard)
 
 @dp.message(Command("stats"))
 async def cmd_stats(message: types.Message):
@@ -265,6 +296,74 @@ async def cmd_stats(message: types.Message):
     
     stats_text = get_user_stats_summary()
     await message.answer(stats_text)
+
+
+async def ask_send_time(message: types.Message):
+    if message.chat.type != "private":
+        await message.answer("Время рассылки можно настроить в личном чате с ботом.")
+        return
+    await message.answer(
+        SEND_TIME_PROMPT, reply_markup=types.ForceReply(input_field_placeholder="18:00")
+    )
+
+
+@dp.callback_query(lambda callback: callback.data == "schedule_regular")
+async def process_schedule_regular(callback: CallbackQuery):
+    await callback.answer()
+    if isinstance(callback.message, types.Message):
+        await ask_send_time(callback.message)
+
+
+@dp.message(Command("time"))
+async def cmd_time(message: types.Message):
+    fields = message.text.split(maxsplit=1)
+    if len(fields) == 1:
+        await ask_send_time(message)
+        return
+    await store_regular_send_time(message, fields[1])
+
+
+@dp.message(
+    lambda message: message.text
+    and message.reply_to_message
+    and message.reply_to_message.from_user
+    and message.reply_to_message.from_user.is_bot
+    and message.reply_to_message.text == SEND_TIME_PROMPT
+)
+async def process_send_time_reply(message: types.Message):
+    await store_regular_send_time(message, message.text)
+
+
+async def store_regular_send_time(message: types.Message, text: str):
+    if message.chat.type != "private":
+        await ask_send_time(message)
+        return
+    match = re.fullmatch(r"([01]\d|2[0-3]):([0-5]\d)(?:\s+([+-]\d{2}:[0-5]\d))?", text.strip())
+    if not match:
+        await ask_send_time(message)
+        return
+    user_id = str(message.from_user.id)
+    stored_time = user_settings.get(user_id, {}).get("send_time")
+    offset = match[3] or (stored_time[5:] if stored_time else DEFAULT_SEND_OFFSET)
+    try:
+        clock_time = datetime.time.fromisoformat(f"{match[1]}:{match[2]}{offset}")
+    except ValueError:
+        await ask_send_time(message)
+        return
+    settings = user_settings.setdefault(user_id, {})
+    settings["send_time"] = clock_time.isoformat(timespec="minutes")
+    settings["last_activity"] = datetime.datetime.now().isoformat()
+    set_next_regular_delivery(settings, datetime.datetime.now(UTC))
+    save_data(user_settings)
+
+    response = f"Время рассылки сохранено: {clock_time:%H:%M} (UTC{offset})."
+    if "next_regular_at" in settings:
+        next_regular = datetime.datetime.fromisoformat(settings["next_regular_at"]).astimezone(clock_time.tzinfo)
+        response += f"\nБлижайшая отправка по этому расписанию: {next_regular:%d.%m.%Y в %H:%M}."
+    else:
+        response += "\nЧтобы включить рассылку, выберите частоту в /settings."
+    await message.answer(response)
+
 
 def next_quote_instructions():
     tomorrow = (datetime.datetime.now(UTC) + datetime.timedelta(days=1)).strftime("%d.%m.%Y")
@@ -351,10 +450,14 @@ async def process_frequency_callback(callback_query: CallbackQuery):
     
     if user_id not in user_settings:
         user_settings[user_id] = {'frequency': 'daily', 'last_sent': None, 'quotes_sent': 0}
-    user_settings[user_id]['frequency'] = new_freq
+    settings = user_settings[user_id]
+    old_frequency = settings.get('frequency')
+    settings['frequency'] = new_freq
     if new_freq == 'off':
-        user_settings[user_id].pop('next_quote_at', None)
-    user_settings[user_id]['last_activity'] = datetime.datetime.now().isoformat()
+        settings.pop('next_quote_at', None)
+    if old_frequency != new_freq or "next_regular_at" not in settings:
+        set_next_regular_delivery(settings, datetime.datetime.now(UTC))
+    settings['last_activity'] = datetime.datetime.now().isoformat()
     save_data(user_settings)
 
     await callback_query.answer()
@@ -374,6 +477,7 @@ async def scheduled_quote_sender():
                 continue
             interval = INTERVALS.get(settings.get("frequency"))
             override = settings.get("next_quote_at")
+            regular_at = settings.get("next_regular_at")
             if interval is None and not override:
                 continue
             send = partial(bot.send_message, int(user_id))
@@ -385,6 +489,9 @@ async def scheduled_quote_sender():
                     continue
                 if override:
                     if datetime.datetime.fromisoformat(override) > utc_now:
+                        continue
+                elif regular_at:
+                    if datetime.datetime.fromisoformat(regular_at) > utc_now:
                         continue
                 elif not interval_has_elapsed(settings.get("last_sent"), now, interval):
                     continue
@@ -406,9 +513,28 @@ def interval_has_elapsed(last_sent, now, interval):
 
 # --- ЗАПУСК БОТА ---
 
+async def register_stats_command():
+    stats_command = types.BotCommand(command="stats", description="Число подписчиков")
+    for language_code in (None, "ru"):
+        commands = await bot.get_my_commands(language_code=language_code)
+        if language_code and not commands:
+            continue
+        by_name = {command.command: command for command in commands}
+        by_name[stats_command.command] = stats_command
+        updated_commands = list(by_name.values())
+        if updated_commands != commands:
+            await bot.set_my_commands(updated_commands, language_code=language_code)
+
+
 async def main():
+    try:
+        await register_stats_command()
+        print("📋 Меню команд Telegram: /stats — Число подписчиков", flush=True)
+    except TelegramAPIError as error:
+        print(f"❌ Не удалось обновить меню команд Telegram: {error}", flush=True)
     scheduler = AsyncIOScheduler()
-    scheduler.add_job(scheduled_quote_sender, IntervalTrigger(minutes=1))
+    first_tick = datetime.datetime.now(UTC).replace(second=0, microsecond=0) + datetime.timedelta(minutes=1)
+    scheduler.add_job(scheduled_quote_sender, IntervalTrigger(minutes=1, start_date=first_tick, timezone=UTC))
     scheduler.start()
     print("🚀 Планировщик запущен!")
     print(f"📖 Загружено отрывков: {len(QUOTES)}, уникальных: {len(QUOTES_BY_ID)} ({QUOTES_FILE})")
@@ -416,7 +542,8 @@ async def main():
     print(
         f"📊 Загружено пользователей: {len(user_settings)} ({DATA_FILE}). "
         f"Подписчиков: {sum(subscribers.values())}, выключили рассылку: {off}, "
-        f"недоступны в Telegram: {unreachable}."
+        f"недоступны в Telegram: {unreachable}.",
+        flush=True,
     )
     
     await dp.start_polling(bot)
