@@ -8,6 +8,7 @@ from collections import defaultdict
 from functools import partial
 from hashlib import sha256
 from pathlib import Path
+from time import monotonic
 from aiogram import Bot, Dispatcher, types
 from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError
 from aiogram.filters import Command
@@ -54,6 +55,8 @@ FEEDBACK_PROMPT = "Напишите автору текстовое сообще
 FEEDBACK_REPLY_PREFIX = "Напишите ответ подписчику.\nНомер обращения: "
 FEEDBACK_CALLBACK_PREFIX = "feedback_reply:"
 FEEDBACK_ROUTE_PATTERN = re.compile(r"([1-9][0-9]{0,15}):([1-9][0-9]{0,9})")
+FEEDBACK_DRAFTS = {}
+FEEDBACK_DRAFT_LIFETIME = 10 * 60
 # -------------------------------------
 
 # Инициализация бота и диспетчера
@@ -325,31 +328,57 @@ def private_bot_prompt(message: types.Message):
     return ""
 
 
+def pending_feedback(message: types.Message):
+    if message.reply_to_message or not message.text or message.text.startswith("/"):
+        return None
+    draft = FEEDBACK_DRAFTS.get(message.chat.id)
+    if draft and draft[0] <= monotonic():
+        FEEDBACK_DRAFTS.pop(message.chat.id, None)
+        return None
+    return draft
+
+
+def is_feedback_submission(message: types.Message):
+    if message.chat.type != "private":
+        return False
+    if private_bot_prompt(message) == FEEDBACK_PROMPT:
+        return True
+    draft = pending_feedback(message)
+    return draft is not None and draft[1] is None
+
+
 @dp.message(Command("feedback"))
 async def cmd_feedback(message: types.Message):
     if message.chat.type != "private":
         await message.answer("Написать автору можно в личном чате с ботом.")
         return
+    FEEDBACK_DRAFTS[message.chat.id] = (monotonic() + FEEDBACK_DRAFT_LIFETIME, None)
     await message.answer(FEEDBACK_PROMPT, reply_markup=types.ForceReply())
 
 
-@dp.message(lambda message: private_bot_prompt(message) == FEEDBACK_PROMPT)
+@dp.message(is_feedback_submission)
 async def process_feedback(message: types.Message):
+    if not is_feedback_submission(message):
+        return
     if not message.text:
         await cmd_feedback(message)
         return
+    draft = FEEDBACK_DRAFTS.get(message.chat.id)
+    if draft is not None and draft[1] is None:
+        FEEDBACK_DRAFTS.pop(message.chat.id, None)
     route = f"{message.chat.id}:{message.message_id}"
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Ответить", callback_data=FEEDBACK_CALLBACK_PREFIX + route)]
     ])
+    text = f"Сообщение автору\n\n{message.text}"
+    if len(text.encode("utf-16-le")) // 2 > 4096:
+        text = message.text
     try:
-        await bot.copy_message(
-            chat_id=ADMIN_ID,
-            from_chat_id=message.chat.id,
-            message_id=message.message_id,
-            reply_markup=keyboard,
-        )
-    except TelegramAPIError:
+        await bot.send_message(ADMIN_ID, text, reply_markup=keyboard)
+    except TelegramAPIError as error:
+        if draft is not None and draft[1] is None:
+            FEEDBACK_DRAFTS.setdefault(message.chat.id, draft)
+        print(f"Не удалось доставить обращение автору: {type(error).__name__}", flush=True)
         await message.answer("Не удалось отправить сообщение автору. Попробуйте позже.")
         return
     await message.answer("Сообщение отправлено автору.")
@@ -370,6 +399,7 @@ async def process_feedback_reply_button(callback: CallbackQuery):
         await callback.answer("Не удалось открыть обращение.")
         return
     await callback.answer()
+    FEEDBACK_DRAFTS[ADMIN_ID] = (monotonic() + FEEDBACK_DRAFT_LIFETIME, route)
     await message.answer(
         FEEDBACK_REPLY_PREFIX + route,
         reply_markup=types.ForceReply(),
@@ -377,32 +407,44 @@ async def process_feedback_reply_button(callback: CallbackQuery):
     )
 
 
-@dp.message(
-    lambda message: message.chat.id == ADMIN_ID
-    and message.from_user
-    and message.from_user.id == ADMIN_ID
-    and private_bot_prompt(message).startswith(FEEDBACK_REPLY_PREFIX)
-)
-async def process_author_reply(message: types.Message):
+def author_reply_route(message: types.Message):
+    if message.chat.id != ADMIN_ID or not message.from_user or message.from_user.id != ADMIN_ID:
+        return None
     prompt = private_bot_prompt(message)
-    route = FEEDBACK_ROUTE_PATTERN.fullmatch(prompt.removeprefix(FEEDBACK_REPLY_PREFIX))
+    if prompt.startswith(FEEDBACK_REPLY_PREFIX):
+        return prompt.removeprefix(FEEDBACK_REPLY_PREFIX)
+    draft = pending_feedback(message)
+    return draft[1] if draft is not None else None
+
+
+@dp.message(lambda message: author_reply_route(message) is not None)
+async def process_author_reply(message: types.Message):
+    route_text = author_reply_route(message)
+    route = FEEDBACK_ROUTE_PATTERN.fullmatch(route_text or "")
     if not route:
         await message.answer("Не удалось найти обращение.")
         return
     if not message.text:
-        await message.answer(prompt, reply_markup=types.ForceReply(input_field_placeholder="Введите текст ответа"))
+        await message.answer(
+            FEEDBACK_REPLY_PREFIX + route_text,
+            reply_markup=types.ForceReply(input_field_placeholder="Введите текст ответа"),
+        )
         return
+    draft = FEEDBACK_DRAFTS.get(ADMIN_ID)
+    if draft is not None and draft[1] == route_text:
+        FEEDBACK_DRAFTS.pop(ADMIN_ID, None)
     reader_id, original_message_id = map(int, route.groups())
     try:
-        await bot.copy_message(
-            chat_id=reader_id,
-            from_chat_id=ADMIN_ID,
-            message_id=message.message_id,
+        await bot.send_message(
+            reader_id, message.text,
             reply_parameters=types.ReplyParameters(
                 message_id=original_message_id, allow_sending_without_reply=True
             ),
         )
-    except TelegramAPIError:
+    except TelegramAPIError as error:
+        if draft is not None and draft[1] == route_text:
+            FEEDBACK_DRAFTS.setdefault(ADMIN_ID, draft)
+        print(f"Не удалось доставить ответ подписчику: {type(error).__name__}", flush=True)
         await message.answer("Не удалось доставить ответ подписчику.")
         return
     await message.answer("Ответ отправлен подписчику.")
