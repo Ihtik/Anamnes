@@ -529,6 +529,47 @@ def interval_has_elapsed(last_sent, now, interval):
 
 # --- ЗАПУСК БОТА ---
 
+def remove_contact_note(description):
+    lines = description.splitlines()
+    updated_lines = []
+    skip_address = False
+    for line in lines:
+        if skip_address and re.fullmatch(r"(?:@|https?://t\.me/)[A-Za-z0-9_]+", line.strip()):
+            skip_address = False
+            continue
+        skip_address = False
+        note = re.search(r"(?:^|(?<=[.!?]))[^\w]*для[ \t]+обратной[ \t]+связи\b", line, re.IGNORECASE)
+        if note is None:
+            updated_lines.append(line)
+            continue
+        prefix = line[:note.start()].rstrip()
+        if prefix:
+            updated_lines.append(prefix)
+        skip_address = not line[note.end():].strip(" \t:–—-")
+    if lines == updated_lines:
+        return description
+    return "\n".join(updated_lines).strip()
+
+
+async def update_telegram_descriptions():
+    fields = (
+        ("description", bot.get_my_description, bot.set_my_description),
+        ("short_description", bot.get_my_short_description, bot.set_my_short_description),
+    )
+    verified_changes = 0
+    for field, read_description, write_description in fields:
+        for language_code in (None, "ru"):
+            current = getattr(await read_description(language_code=language_code), field)
+            updated = remove_contact_note(current)
+            if updated == current:
+                continue
+            await write_description(**{field: updated}, language_code=language_code)
+            confirmed = getattr(await read_description(language_code=language_code), field)
+            if confirmed == updated:
+                verified_changes += 1
+    return verified_changes
+
+
 async def register_stats_command():
     stats_command = types.BotCommand(command="stats", description="Число подписчиков")
     for language_code in (None, "ru"):
@@ -543,6 +584,11 @@ async def register_stats_command():
 
 
 async def main():
+    try:
+        profile_changes = await update_telegram_descriptions()
+        print(f"📝 Telegram: подтверждено изменений описания — {profile_changes}", flush=True)
+    except TelegramAPIError as error:
+        print(f"❌ Не удалось обновить описание Telegram: {error}", flush=True)
     try:
         await register_stats_command()
         print("📋 Меню команд Telegram: /stats — Число подписчиков", flush=True)
