@@ -44,6 +44,17 @@ SEND_TIME_PROMPT = (
     "При первой настройке используется UTC+05:00. Для другого часового пояса "
     "укажите его после времени, например 18:00 +03:00."
 )
+FREQUENCY_TIME_PROMPTS = {
+    "hourly": (
+        "Каждый час. Ответьте минутой от 00 до 59, например 34. Можно также написать 15:34.\n"
+        "При первой настройке используется UTC+05:00. Для другого пояса укажите его после "
+        "минуты, например 34 +03:00."
+    ),
+    "daily": f"Каждый день. {SEND_TIME_PROMPT}",
+    "2days": f"Раз в 2 дня. {SEND_TIME_PROMPT}",
+    "weekly": f"Раз в неделю. {SEND_TIME_PROMPT}",
+}
+FREQUENCY_BY_TIME_PROMPT = {prompt: frequency for frequency, prompt in FREQUENCY_TIME_PROMPTS.items()}
 # -------------------------------------
 
 # Инициализация бота и диспетчера
@@ -132,12 +143,18 @@ def get_user_stats_summary():
 
 def set_next_regular_delivery(settings, now):
     send_time = settings.get("send_time")
-    if send_time and settings.get("frequency") in INTERVALS:
+    frequency = settings.get("frequency")
+    if send_time and frequency in INTERVALS:
         clock_time = datetime.time.fromisoformat(send_time)
         local_now = now.astimezone(clock_time.tzinfo)
-        due_at = datetime.datetime.combine(local_now.date(), clock_time)
+        if frequency == "hourly":
+            due_at = local_now.replace(minute=clock_time.minute, second=0, microsecond=0)
+            step = datetime.timedelta(hours=1)
+        else:
+            due_at = datetime.datetime.combine(local_now.date(), clock_time)
+            step = datetime.timedelta(days=1)
         if due_at <= local_now:
-            due_at += datetime.timedelta(days=1)
+            due_at += step
         settings["next_regular_at"] = due_at.astimezone(UTC).isoformat()
     else:
         settings.pop("next_regular_at", None)
@@ -297,13 +314,13 @@ async def cmd_stats(message: types.Message):
     await message.answer(stats_text)
 
 
-async def ask_send_time(message: types.Message):
+async def ask_send_time(message: types.Message, frequency=None):
     if message.chat.type != "private":
         await message.answer("Время рассылки можно настроить в личном чате с ботом.")
         return
-    await message.answer(
-        SEND_TIME_PROMPT, reply_markup=types.ForceReply(input_field_placeholder="18:00")
-    )
+    prompt = FREQUENCY_TIME_PROMPTS.get(frequency, SEND_TIME_PROMPT)
+    placeholder = "34" if frequency == "hourly" else "18:00"
+    await message.answer(prompt, reply_markup=types.ForceReply(input_field_placeholder=placeholder))
 
 
 @dp.callback_query(lambda callback: callback.data == "schedule_regular")
@@ -327,35 +344,51 @@ async def cmd_time(message: types.Message):
     and message.reply_to_message
     and message.reply_to_message.from_user
     and message.reply_to_message.from_user.is_bot
-    and message.reply_to_message.text == SEND_TIME_PROMPT
+    and (
+        message.reply_to_message.text == SEND_TIME_PROMPT
+        or message.reply_to_message.text in FREQUENCY_BY_TIME_PROMPT
+    )
 )
 async def process_send_time_reply(message: types.Message):
-    await store_regular_send_time(message, message.text)
+    frequency = FREQUENCY_BY_TIME_PROMPT.get(message.reply_to_message.text)
+    await store_regular_send_time(message, message.text, frequency)
 
 
-async def store_regular_send_time(message: types.Message, text: str):
+async def store_regular_send_time(message: types.Message, text: str, frequency=None):
     if message.chat.type != "private":
         await ask_send_time(message)
         return
-    match = re.fullmatch(r"([01]\d|2[0-3]):([0-5]\d)(?:\s+([+-]\d{2}:[0-5]\d))?", text.strip())
-    if not match:
-        await ask_send_time(message)
-        return
     user_id = str(message.from_user.id)
-    stored_time = user_settings.get(user_id, {}).get("send_time")
+    previous = user_settings.get(user_id, {})
+    effective_frequency = frequency or previous.get("frequency")
+    time_text = text.strip()
+    minute = re.fullmatch(r"([0-5]?\d)(\s+[+-]\d{2}:[0-5]\d)?", time_text)
+    if effective_frequency == "hourly" and minute:
+        time_text = f"00:{int(minute[1]):02d}{minute[2] or ''}"
+    match = re.fullmatch(r"([01]\d|2[0-3]):([0-5]\d)(?:\s+([+-]\d{2}:[0-5]\d))?", time_text)
+    if not match:
+        await ask_send_time(message, frequency)
+        return
+    stored_time = previous.get("send_time")
     offset = match[3] or (stored_time[5:] if stored_time else DEFAULT_SEND_OFFSET)
     try:
         clock_time = datetime.time.fromisoformat(f"{match[1]}:{match[2]}{offset}")
     except ValueError:
-        await ask_send_time(message)
+        await ask_send_time(message, frequency)
         return
     settings = user_settings.setdefault(user_id, {})
+    if frequency:
+        settings["frequency"] = frequency
     settings["send_time"] = clock_time.isoformat(timespec="minutes")
     settings["last_activity"] = datetime.datetime.now().isoformat()
+    settings.pop("telegram_unreachable", None)
     set_next_regular_delivery(settings, datetime.datetime.now(UTC))
     save_data(user_settings)
 
-    response = f"Время рассылки сохранено: {clock_time:%H:%M} (UTC{offset})."
+    if effective_frequency == "hourly":
+        response = f"Рассылка каждый час в {clock_time.minute:02d}-ю минуту (UTC{offset})."
+    else:
+        response = f"Время рассылки сохранено: {clock_time:%H:%M} (UTC{offset})."
     if "next_regular_at" in settings:
         next_regular = datetime.datetime.fromisoformat(settings["next_regular_at"]).astimezone(clock_time.tzinfo)
         response += f"\nБлижайшая отправка по этому расписанию: {next_regular:%d.%m.%Y в %H:%M}."
@@ -437,32 +470,22 @@ async def process_bot_membership(event: types.ChatMemberUpdated):
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("freq_"))
 async def process_frequency_callback(callback_query: CallbackQuery):
-    user_id = str(callback_query.from_user.id)
-    freq_map = {
-        'freq_hourly': 'hourly',
-        'freq_daily': 'daily',
-        'freq_2days': '2days',
-        'freq_weekly': 'weekly',
-        'freq_off': 'off'
-    }
-    new_freq = freq_map.get(callback_query.data, 'daily')
-    
-    if user_id not in user_settings:
-        user_settings[user_id] = {'frequency': 'daily', 'last_sent': None, 'quotes_sent': 0}
-    settings = user_settings[user_id]
-    old_frequency = settings.get('frequency')
-    settings['frequency'] = new_freq
-    if new_freq == 'off':
-        settings.pop('next_quote_at', None)
-    if old_frequency != new_freq or "next_regular_at" not in settings:
-        set_next_regular_delivery(settings, datetime.datetime.now(UTC))
-    settings['last_activity'] = datetime.datetime.now().isoformat()
-    save_data(user_settings)
-
     await callback_query.answer()
-    await callback_query.message.edit_text(
-        f"✅ Настройка сохранена! Частота рассылки: {FREQUENCY_LABELS[new_freq]}."
-    )
+    message = callback_query.message
+    if not isinstance(message, types.Message):
+        return
+    frequency = callback_query.data.removeprefix("freq_")
+    if frequency in INTERVALS:
+        await ask_send_time(message, frequency)
+    elif frequency == "off":
+        user_id = str(callback_query.from_user.id)
+        settings = user_settings.setdefault(user_id, {})
+        settings["frequency"] = "off"
+        settings.pop("next_quote_at", None)
+        settings.pop("next_regular_at", None)
+        settings["last_activity"] = datetime.datetime.now().isoformat()
+        save_data(user_settings)
+        await message.edit_text("Рассылка отключена.")
 
 # --- РАССЫЛКА ПО РАСПИСАНИЮ ---
 
