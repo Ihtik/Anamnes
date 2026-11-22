@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Время рассылки</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <style>
+    :root {
+      --background: var(--tg-theme-bg-color, #ffffff);
+      --surface: var(--tg-theme-secondary-bg-color, #f2f3f6);
+      --text: var(--tg-theme-text-color, #17202c);
+      --muted: var(--tg-theme-hint-color, #667386);
+      --accent: var(--tg-theme-button-color, #2577ba);
+      --accent-text: var(--tg-theme-button-text-color, #ffffff);
+      --row-height: 48px;
+      color: var(--text);
+      background: var(--background);
+      font-family: system-ui, sans-serif;
+    }
+
+    body {
+      box-sizing: border-box;
+      min-height: 100vh;
+      min-height: var(--tg-viewport-stable-height, 100dvh);
+      margin: 0;
+      padding: 28px 20px max(24px, env(safe-area-inset-bottom));
+      display: grid;
+      place-items: center;
+    }
+
+    main { width: min(100%, 348px); }
+    header { text-align: center; }
+    h1 { font-size: 25px; line-height: 1.2; margin: 0; letter-spacing: -0.025em; }
+    header p { margin: 8px 0 0; color: var(--muted); font-size: 15px; }
+    header p:empty { display: none; }
+
+    .labels, .wheels {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 22px minmax(0, 1fr);
+      text-align: center;
+    }
+
+    .labels { margin-top: 26px; color: var(--muted); font-size: 13px; font-weight: 550; }
+    .labels span:last-child { grid-column: 3; }
+    .wheels { position: relative; align-items: center; margin: 7px 0 20px; isolation: isolate; }
+
+    .wheels::before {
+      content: "";
+      pointer-events: none;
+      position: absolute;
+      z-index: -1;
+      top: calc(2 * var(--row-height));
+      height: var(--row-height);
+      inset-inline: 0;
+      border-radius: 12px;
+      background: var(--surface);
+    }
+
+    .wheel {
+      box-sizing: border-box;
+      height: calc(5 * var(--row-height));
+      overflow-y: auto;
+      padding-block: calc(2 * var(--row-height));
+      scroll-snap-type: y mandatory;
+      scrollbar-width: none;
+      overscroll-behavior: contain;
+      touch-action: pan-y;
+      -webkit-overflow-scrolling: touch;
+      mask-image: linear-gradient(transparent, black 30%, black 70%, transparent);
+    }
+
+    .wheel::-webkit-scrollbar { display: none; }
+    .wheel:focus-visible { outline: 2px solid var(--accent); outline-offset: -3px; }
+
+    .wheel button {
+      display: block;
+      width: 100%;
+      min-height: var(--row-height);
+      padding: 0;
+      border: 0;
+      background: transparent;
+      color: var(--muted);
+      font: 450 24px/1 system-ui, sans-serif;
+      font-variant-numeric: tabular-nums;
+      scroll-snap-align: center;
+      cursor: pointer;
+    }
+
+    .wheel button[aria-selected="true"], .separator {
+      color: var(--text);
+      font-size: 30px;
+      font-weight: 650;
+    }
+
+    .save {
+      width: 100%;
+      min-height: 50px;
+      border: 0;
+      border-radius: 13px;
+      color: var(--accent-text);
+      background: var(--accent);
+      cursor: pointer;
+      font: 600 16px/1 system-ui, sans-serif;
+    }
+
+    .save:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+    .save:disabled { opacity: 0.65; }
+    .status { text-align: center; color: var(--muted); font-size: 14px; margin: 10px 0 0; }
+    .status:empty { margin: 0; }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Время рассылки</h1>
+      <p id="frequency"></p>
+    </header>
+    <div class="labels" aria-hidden="true"><span>Часы</span><span>Минуты</span></div>
+    <div class="wheels">
+      <div class="wheel" id="hours" role="listbox" aria-label="Часы" tabindex="0"></div>
+      <span class="separator" aria-hidden="true">:</span>
+      <div class="wheel" id="minutes" role="listbox" aria-label="Минуты" tabindex="0"></div>
+    </div>
+    <button type="button" class="save" id="save">Сохранить</button>
+    <p class="status" id="status" role="status"></p>
+  </main>
+  <script>
+    const telegram = window.Telegram?.WebApp;
+    const query = new URLSearchParams(window.location.search);
+    const frequency = ["daily", "weekly"].includes(query.get("frequency"))
+      ? query.get("frequency")
+      : "current";
+    const labels = {daily: "Каждый день", weekly: "Раз в неделю"};
+    document.getElementById("frequency").textContent = labels[frequency] || "";
+
+    const now = new Date();
+    const saved = /^([01]\d|2[0-3]):([0-5]\d)([+-])(\d{2}):([0-5]\d)$/.exec(query.get("time") || "");
+    const selectedHour = saved ? Number(saved[1]) : now.getHours();
+    const selectedMinute = saved ? Number(saved[2]) : now.getMinutes();
+    const offset = saved ? (saved[3] === "-" ? -1 : 1) * (Number(saved[4]) * 60 + Number(saved[5]))
+      : -now.getTimezoneOffset();
+
+    function createWheel(element, count, initialValue) {
+      const options = [];
+      let currentValue;
+      for (let value = 0; value < count; value += 1) {
+        const option = document.createElement("button");
+        option.type = "button";
+        option.id = element.id + "-" + value;
+        option.tabIndex = -1;
+        option.setAttribute("role", "option");
+        option.setAttribute("aria-selected", "false");
+        option.textContent = String(value).padStart(2, "0");
+        option.addEventListener("click", () => select(value));
+        element.append(option);
+        options.push(option);
+      }
+
+      const rowHeight = () => options[0].offsetHeight;
+      const valueAtCenter = () => Math.max(0, Math.min(count - 1, Math.round(element.scrollTop / rowHeight())));
+
+      function refresh() {
+        const value = valueAtCenter();
+        if (value !== currentValue) {
+          options[currentValue]?.setAttribute("aria-selected", "false");
+          options[value].setAttribute("aria-selected", "true");
+          element.setAttribute("aria-activedescendant", options[value].id);
+          currentValue = value;
+        }
+      }
+
+      function select(value) {
+        element.scrollTop = Math.max(0, Math.min(count - 1, value)) * rowHeight();
+        refresh();
+      }
+
+      element.addEventListener("scroll", refresh, {passive: true});
+      element.addEventListener("keydown", (event) => {
+        const value = valueAtCenter();
+        const destinations = {ArrowUp: value - 1, ArrowDown: value + 1, Home: 0, End: count - 1};
+        if (Object.hasOwn(destinations, event.key)) {
+          event.preventDefault();
+          select(destinations[event.key]);
+        }
+      });
+      select(initialValue);
+      return valueAtCenter;
+    }
+
+    const hour = createWheel(document.getElementById("hours"), 24, selectedHour);
+    const minute = createWheel(document.getElementById("minutes"), 60, selectedMinute);
+    const save = document.getElementById("save");
+    const status = document.getElementById("status");
+
+    save.addEventListener("click", () => {
+      if (!telegram || telegram.platform === "unknown") {
+        status.textContent = "Откройте выбор времени через /settings в чате с ботом.";
+        return;
+      }
+      try {
+        telegram.sendData(JSON.stringify({frequency, hour: hour(), minute: minute(), offset}));
+        save.disabled = true;
+      } catch {
+        status.textContent = "Не удалось отправить время. Откройте /settings и попробуйте ещё раз.";
+      }
+    });
+
+    telegram?.ready();
+    telegram?.expand();
+    if (telegram?.isVersionAtLeast?.("7.7")) telegram.disableVerticalSwipes();
+  </script>
+</body>
+</html>
