@@ -39,22 +39,17 @@ FREQUENCY_LABELS = {
 }
 UTC = datetime.timezone.utc
 DEFAULT_SEND_OFFSET = "+05:00"
-SEND_TIME_PROMPT = (
-    "Ответьте временем в формате ЧЧ:ММ, например 18:00 или 15:34.\n"
-    "При первой настройке используется UTC+05:00. Для другого часового пояса "
-    "укажите его после времени, например 18:00 +03:00."
-)
+SEND_TIME_PROMPT = "Ответьте временем в формате ЧЧ:ММ, например 18:00 или 15:34."
 FREQUENCY_TIME_PROMPTS = {
     "hourly": (
-        "Каждый час. Ответьте минутой от 00 до 59, например 34. Можно также написать 15:34.\n"
-        "При первой настройке используется UTC+05:00. Для другого пояса укажите его после "
-        "минуты, например 34 +03:00."
+        "Каждый час. Ответьте минутой от 00 до 59, например 34. Можно также написать 15:34."
     ),
     "daily": f"Каждый день. {SEND_TIME_PROMPT}",
     "2days": f"Раз в 2 дня. {SEND_TIME_PROMPT}",
     "weekly": f"Раз в неделю. {SEND_TIME_PROMPT}",
 }
 FREQUENCY_BY_TIME_PROMPT = {prompt: frequency for frequency, prompt in FREQUENCY_TIME_PROMPTS.items()}
+FREQUENCY_BY_TIME_PROMPT[SEND_TIME_PROMPT] = None
 # -------------------------------------
 
 # Инициализация бота и диспетчера
@@ -344,13 +339,12 @@ async def cmd_time(message: types.Message):
     and message.reply_to_message
     and message.reply_to_message.from_user
     and message.reply_to_message.from_user.is_bot
-    and (
-        message.reply_to_message.text == SEND_TIME_PROMPT
-        or message.reply_to_message.text in FREQUENCY_BY_TIME_PROMPT
-    )
+    and message.reply_to_message.text
+    and message.reply_to_message.text.partition("\n")[0] in FREQUENCY_BY_TIME_PROMPT
 )
 async def process_send_time_reply(message: types.Message):
-    frequency = FREQUENCY_BY_TIME_PROMPT.get(message.reply_to_message.text)
+    prompt = message.reply_to_message.text.partition("\n")[0]
+    frequency = FREQUENCY_BY_TIME_PROMPT[prompt]
     await store_regular_send_time(message, message.text, frequency)
 
 
