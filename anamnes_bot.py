@@ -50,6 +50,10 @@ FREQUENCY_TIME_PROMPTS = {
 }
 FREQUENCY_BY_TIME_PROMPT = {prompt: frequency for frequency, prompt in FREQUENCY_TIME_PROMPTS.items()}
 FREQUENCY_BY_TIME_PROMPT[SEND_TIME_PROMPT] = None
+FEEDBACK_PROMPT = "Напишите автору текстовое сообщение."
+FEEDBACK_REPLY_PREFIX = "Напишите ответ подписчику.\nНомер обращения: "
+FEEDBACK_CALLBACK_PREFIX = "feedback_reply:"
+FEEDBACK_ROUTE_PATTERN = re.compile(r"([1-9][0-9]{0,15}):([1-9][0-9]{0,9})")
 # -------------------------------------
 
 # Инициализация бота и диспетчера
@@ -243,7 +247,7 @@ async def cmd_start(message: types.Message):
     
     await message.answer(
         "«Анамнез» — книга Якупа Шапиро. Я присылаю из неё случайные отрывки.\n"
-        "Настроить рассылку можно в /settings. Число подписчиков — /stats."
+        "Настроить рассылку можно в /settings."
     )
     await send_quote(message, user_id)
 
@@ -307,6 +311,101 @@ async def cmd_stats(message: types.Message):
     
     stats_text = get_user_stats_summary()
     await message.answer(stats_text)
+
+
+def private_bot_prompt(message: types.Message):
+    original = message.reply_to_message
+    if (
+        message.chat.type == "private"
+        and original
+        and original.from_user
+        and original.from_user.id == bot.id
+    ):
+        return original.text or ""
+    return ""
+
+
+@dp.message(Command("feedback"))
+async def cmd_feedback(message: types.Message):
+    if message.chat.type != "private":
+        await message.answer("Написать автору можно в личном чате с ботом.")
+        return
+    await message.answer(FEEDBACK_PROMPT, reply_markup=types.ForceReply())
+
+
+@dp.message(lambda message: private_bot_prompt(message) == FEEDBACK_PROMPT)
+async def process_feedback(message: types.Message):
+    if not message.text:
+        await cmd_feedback(message)
+        return
+    route = f"{message.chat.id}:{message.message_id}"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Ответить", callback_data=FEEDBACK_CALLBACK_PREFIX + route)]
+    ])
+    try:
+        await bot.copy_message(
+            chat_id=ADMIN_ID,
+            from_chat_id=message.chat.id,
+            message_id=message.message_id,
+            reply_markup=keyboard,
+        )
+    except TelegramAPIError:
+        await message.answer("Не удалось отправить сообщение автору. Попробуйте позже.")
+        return
+    await message.answer("Сообщение отправлено автору.")
+
+
+@dp.callback_query(lambda callback: (callback.data or "").startswith(FEEDBACK_CALLBACK_PREFIX))
+async def process_feedback_reply_button(callback: CallbackQuery):
+    message = callback.message
+    if (
+        callback.from_user.id != ADMIN_ID
+        or not isinstance(message, types.Message)
+        or message.chat.id != ADMIN_ID
+    ):
+        await callback.answer("Эта кнопка доступна автору.")
+        return
+    route = callback.data.removeprefix(FEEDBACK_CALLBACK_PREFIX)
+    if not FEEDBACK_ROUTE_PATTERN.fullmatch(route):
+        await callback.answer("Не удалось открыть обращение.")
+        return
+    await callback.answer()
+    await message.answer(
+        FEEDBACK_REPLY_PREFIX + route,
+        reply_markup=types.ForceReply(),
+        reply_parameters=types.ReplyParameters(message_id=message.message_id),
+    )
+
+
+@dp.message(
+    lambda message: message.chat.id == ADMIN_ID
+    and message.from_user
+    and message.from_user.id == ADMIN_ID
+    and private_bot_prompt(message).startswith(FEEDBACK_REPLY_PREFIX)
+)
+async def process_author_reply(message: types.Message):
+    prompt = private_bot_prompt(message)
+    route = FEEDBACK_ROUTE_PATTERN.fullmatch(prompt.removeprefix(FEEDBACK_REPLY_PREFIX))
+    if not route:
+        await message.answer("Не удалось найти обращение.")
+        return
+    if not message.text:
+        await message.answer(prompt, reply_markup=types.ForceReply(input_field_placeholder="Введите текст ответа"))
+        return
+    reader_id, original_message_id = map(int, route.groups())
+    try:
+        await bot.copy_message(
+            chat_id=reader_id,
+            from_chat_id=ADMIN_ID,
+            message_id=message.message_id,
+            reply_parameters=types.ReplyParameters(
+                message_id=original_message_id, allow_sending_without_reply=True
+            ),
+        )
+    except TelegramAPIError:
+        await message.answer("Не удалось доставить ответ подписчику.")
+        return
+    await message.answer("Ответ отправлен подписчику.")
 
 
 async def ask_send_time(message: types.Message, frequency=None):
@@ -570,14 +669,17 @@ async def update_telegram_descriptions():
     return verified_changes
 
 
-async def register_stats_command():
-    stats_command = types.BotCommand(command="stats", description="Число подписчиков")
+async def register_bot_commands():
+    managed_commands = (
+        types.BotCommand(command="stats", description="Число подписчиков"),
+        types.BotCommand(command="feedback", description="Написать автору"),
+    )
     for language_code in (None, "ru"):
         commands = await bot.get_my_commands(language_code=language_code)
         if language_code and not commands:
             continue
         by_name = {command.command: command for command in commands}
-        by_name[stats_command.command] = stats_command
+        by_name.update((command.command, command) for command in managed_commands)
         updated_commands = list(by_name.values())
         if updated_commands != commands:
             await bot.set_my_commands(updated_commands, language_code=language_code)
@@ -590,8 +692,8 @@ async def main():
     except TelegramAPIError as error:
         print(f"❌ Не удалось обновить описание Telegram: {error}", flush=True)
     try:
-        await register_stats_command()
-        print("📋 Меню команд Telegram: /stats — Число подписчиков", flush=True)
+        await register_bot_commands()
+        print("📋 Меню команд Telegram: /stats — Число подписчиков, /feedback — Написать автору", flush=True)
     except TelegramAPIError as error:
         print(f"❌ Не удалось обновить меню команд Telegram: {error}", flush=True)
     scheduler = AsyncIOScheduler()
